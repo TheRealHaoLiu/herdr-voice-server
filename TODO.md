@@ -14,6 +14,11 @@ Ideas that are agreed on but not built, and things nobody has tried yet.
 - **Desktop app: switching sessions while one is working drops the reply.** The app keeps one
   "working" flag for all sessions, so talking to a second session is sent as a steer and its answer
   is discarded. The phone page does not have this problem.
+- **Permission prompts in the desktop app.** The phone page says what is asked and has Allow and
+  Deny. The app still only says that the session is waiting. Also not built: telling you about a
+  prompt in a session you are not talking to, and an "always allow" choice (left out on purpose).
+- **Trim what piles up.** The spoken-lines queue in `/tmp/herdr-voice` and `app.log` grow without
+  limit, and the three most-recent audio clips could be deleted right after use.
 - **Send now in the desktop app.** The phone page has the button; the app needs a gesture for it.
   Agent programs other than Claude Code are refused because their key for this is not known.
 - **Narration verbosity.** A way to choose how much an agent narrates. Not designed; today it is the
@@ -36,6 +41,8 @@ Ideas that are agreed on but not built, and things nobody has tried yet.
 ## Not tried yet
 
 - Every button in the Setup window, and the Connect a Phone window on a phone set up from nothing.
+- Talking through the desktop app since speech moved fully into it (the phone page, which uses the
+  same models through the app, is in daily use).
 - Two sessions in use at once on the phone page.
 - The Send now button in a real browser (its server side is tested).
 - Announcements moving to the other devices when the device you last talked through goes away.

@@ -27,6 +27,7 @@
           user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; touch-action:none; }
   #stop { flex:none; background:var(--panel); color:var(--bad); border:1px solid var(--bad); border-radius:14px; padding:12px; font-size:16px; font-weight:600; }
   #talk.rec { background:var(--bad); color:#fff; transform:scale(.98); }
+  #talk.rec.away { background:#3a3f47; color:var(--dim); }
   #talk:disabled { background:#3a3f47; color:var(--dim); }
   #gate { display:flex; flex-direction:column; gap:10px; margin:auto 0; }
   #gate input { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:12px; font-size:16px; }
@@ -61,7 +62,20 @@ let clientId = store.get("voice-client"); if (!clientId) { clientId = "page-" + 
 let ctx, stream, rec, chunks = [], recording = false, working = false;
 
 const logs = new Map(); // one chat history per session; only the selected session's is visible
-function logFor(t) { if (!logs.has(t)) { const d = document.createElement("div"); d.className = "log"; d.hidden = true; $("logs").append(d); logs.set(t, d); } return logs.get(t); }
+function logFor(t) { if (!logs.has(t)) { const d = document.createElement("div"); d.className = "log"; d.hidden = true; $("logs").append(d); logs.set(t, d); if (t) loadHistory(t, d); } return logs.get(t); }
+// Earlier messages for a session, kept by the server on the Mac: put above whatever this page has
+// added since, once, the first time the session is opened here.
+async function loadHistory(t, d) {
+  try {
+    const { items } = await api("/api/history?t=" + encodeURIComponent(t) + "&limit=60");
+    if (!items || !items.length) return;
+    const rows = items.map(x => { const r = document.createElement("div");
+      r.className = "row " + (x.who === "me" ? "me" : x.who === "note" ? "sys" : x.from ? "ann" : "said");
+      r.textContent = x.from ? "From " + x.from + ": " + x.text : x.text; r.title = new Date(x.at).toLocaleString(); r.style.opacity = ".8"; return r; });
+    const mark = document.createElement("div"); mark.className = "row sys"; mark.textContent = "— earlier —";
+    d.prepend(...rows, mark); d.lastElementChild?.scrollIntoView({block:"end"});
+  } catch {}
+}
 function showLog(t) { for (const [k, d] of logs) d.hidden = k !== t; const d = logFor(t); d.hidden = false; d.lastElementChild?.scrollIntoView({block:"end"}); }
 function add(cls, text, t = $("sess").value) { const d = document.createElement("div"); d.className = "row " + cls; d.textContent = text; logFor(t).append(d); d.scrollIntoView({block:"end"}); return d; }
 function addScreen(text, t) { if (!text) return; const d = document.createElement("details"); const s = document.createElement("summary"); s.textContent = "What it wrote on screen"; const p = document.createElement("pre"); p.textContent = text; d.append(s, p); logFor(t).append(d); d.scrollIntoView({block:"end"}); }
@@ -139,7 +153,45 @@ async function steer(blob, typed) { // sent while the agent is mid-task: goes in
 }
 $("stop").onclick = async () => { const t = $("sess").value; playChain = Promise.resolve();
   try { const j = await api("/api/stop?t=" + encodeURIComponent(t), { method: "POST" }); add("sys", j.stopped ? "Stopped." : "Could not stop it.", t); } catch (e) { add("err", e.message, t); } };
+// A permission prompt: say and show what is being asked, with Allow and Deny when it can be answered
+// from here. A tap, never a spoken word, so a misheard word cannot approve a command.
+const asking = new Map(); // session -> the request now shown with buttons, so it is not shown twice
+function showAsk(ask, t, quiet = false) {
+  if (asking.get(t) === ask.what) return Promise.resolve();
+  asking.set(t, ask.what);
+  const row = add("ann", ask.text, t);
+  if (ask.can) {
+    const bar = document.createElement("div"); bar.style.cssText = "display:flex;gap:8px;margin-top:8px";
+    const mk = (label, choice) => { const b = document.createElement("button"); b.className = "small"; b.textContent = label; b.style.flex = "1";
+      b.onclick = () => answerAsk(ask, t, choice, row, bar); return b; };
+    const yes = mk("Allow", "allow"), no = mk("Deny", "deny"); yes.style.color = "var(--ok)"; yes.style.borderColor = "var(--ok)"; no.style.color = "var(--bad)"; no.style.borderColor = "var(--bad)";
+    bar.append(yes, no); row.append(bar);
+  }
+  if (quiet) return Promise.resolve();
+  return (ask.audio ? play(ask.audio).catch(() => phoneSpeak(ask.say)) : Promise.resolve(phoneSpeak(ask.say)));
+}
+// A request that was already waiting (the page was reloaded, or it came up while you were elsewhere):
+// show it again, without speaking, whenever a session is opened.
+async function checkAsk(t) { if (!t) return; try { const j = await api("/api/screen?t=" + encodeURIComponent(t)); if (j.ask) showAsk(j.ask, t, true); else asking.delete(t); } catch {} }
+async function answerAsk(ask, t, choice, row, bar) {
+  for (const b of bar.children) b.disabled = true;
+  try {
+    const r = await api("/api/answer?t=" + encodeURIComponent(t) + "&choice=" + choice, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ what: ask.what }) });
+    asking.delete(t);
+    if (r.changed && r.ask) { row.textContent = "That request was replaced by a new one."; showAsk(r.ask, t); return; }
+    if (!r.answered) { bar.remove(); add("err", r.error || "Could not answer it.", t); return; }
+    bar.remove(); row.textContent = (choice === "allow" ? "Allowed: " : "Denied: ") + (ask.what || "the request");
+    if (choice === "allow") follow(t); // the task goes on: keep listening to it
+  } catch (e) { for (const b of bar.children) b.disabled = false; add("err", e.message, t); }
+}
+async function follow(t) { // collect until the task is no longer working
+  setBusy(true, "Still working…", t);
+  try { let j; do { j = await api("/api/collect?t=" + encodeURIComponent(t), { method: "POST" }); await showResult(j, t); } while (j.status === "working"); }
+  catch (e) { add("err", e.message, t); }
+  setBusy(false, undefined, t);
+}
 function showResult(j, t) {
+  if (j.ask) { if (j.note) add("sys", j.note, t); if (j.spoken) add("said", j.spoken, t); addScreen(j.screen, t); const said = j.spoken ? (j.audio ? play(j.audio).catch(() => phoneSpeak(j.spoken)) : Promise.resolve(phoneSpeak(j.spoken))) : Promise.resolve(); return said.then(() => showAsk(j.ask, t)); }
   if (j.error) add("err", j.error, t);
   if (j.spoken) add("said", j.spoken, t); else if (!j.error && !j.command && !j.narrated && j.status !== "working") add("sys", "It finished without saying anything.", t);
   addScreen(j.screen, t);
@@ -161,34 +213,48 @@ async function send(blob, typed) {
   setBusy(false, undefined, t);
 }
 async function start(e) {
-  e.preventDefault(); if (recording) return; steering = working;
+  e.preventDefault(); if (recording) return; steering = working; holding = true;
+  try { if (e.pointerId !== undefined) $("talk").setPointerCapture(e.pointerId); } catch {} // keep getting the finger's moves and its release, wherever it goes
   try {
     ctx = ctx || new (window.AudioContext || window.webkitAudioContext)(); if (ctx.state !== "running") await ctx.resume();
     duck(true); // quieter while you talk
     stream = stream || await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!holding) { duck(false); return; } // let go while the microphone question was showing: do not start a recording nobody is holding
     chunks = []; rec = new MediaRecorder(stream);
     rec.ondataavailable = ev => ev.data.size && chunks.push(ev.data);
     rec.onstop = () => { const blob = new Blob(chunks, { type: rec.mimeType });
+      if (cancelled) { cancelled = false; dropLive(); add("sys", "Cancelled. Nothing was sent."); paintBusy(); return; }
       if (blob.size <= 2500) dropLive();
       if (steering) { $("talk").textContent = "Hold to steer"; if (blob.size > 2500) steer(blob); }
       else if (blob.size > 2500) send(blob); else setBusy(false); };
     dropLive(); const gen = ++liveGen, t = $("sess").value;
     // An iPhone hands over a recording made in pieces with its header second; the server puts it first.
-    if (LIVE) rec.start(1000); else rec.start(); recording = true;
-    clearInterval(liveTimer); if (LIVE) liveTimer = setInterval(() => liveTick(t, gen), 1000); $("talk").classList.add("rec"); $("talk").textContent = "Listening…";
+    if (LIVE) rec.start(1000); else rec.start(); recording = true; away = false;
+    clearInterval(liveTimer); if (LIVE) liveTimer = setInterval(() => liveTick(t, gen), 1000); $("talk").classList.add("rec"); $("talk").textContent = "Listening… (slide up to cancel)";
   } catch (err) { duck(false); add("err", "Microphone not available: " + err.message); }
 }
-function stop(e) { e.preventDefault(); duck(false); if (!recording) return; recording = false; clearInterval(liveTimer); liveGen++; $("talk").classList.remove("rec"); if (!steering) setBusy(true); rec.stop(); }
+// Cancelling: while holding, slide the finger away from the button and let go, and nothing is sent.
+// The button turns grey and says so while the finger is far enough away. On a keyboard, Esc while
+// holding the space bar does the same. A hold the system interrupts is cancelled too, not sent.
+let cancelled = false, away = false;
+let holding = false; // the button or space bar is down right now
+function stop(e, cancel = false) { e.preventDefault(); duck(false); holding = false; if (!recording) return; recording = false; clearInterval(liveTimer); liveGen++;
+  $("talk").classList.remove("rec", "away"); away = false; cancelled = cancel; if (!steering && !cancel) setBusy(true); rec.stop(); }
 $("talk").addEventListener("pointerdown", start);
-for (const ev of ["pointerup","pointercancel","pointerleave"]) $("talk").addEventListener(ev, stop);
+$("talk").addEventListener("pointermove", e => { if (!recording) return; const r = $("talk").getBoundingClientRect();
+  const out = e.clientX < r.left - 40 || e.clientX > r.right + 40 || e.clientY < r.top - 70 || e.clientY > r.bottom + 40;
+  if (out !== away) { away = out; $("talk").classList.toggle("away", out); $("talk").textContent = out ? "Let go to cancel" : "Listening… (slide up to cancel)"; } });
+$("talk").addEventListener("pointerup", e => stop(e, away));
+$("talk").addEventListener("pointercancel", e => stop(e, true));
 const typing = () => ["INPUT","SELECT","TEXTAREA"].includes(document.activeElement?.tagName);
 addEventListener("keydown", e => { if (e.code === "Space" && !e.repeat && !typing() && !$("talk").hidden) start(e); else if (e.code === "Space" && !typing()) e.preventDefault(); });
 addEventListener("keyup", e => { if (e.code === "Space" && !typing()) stop(e); });
+addEventListener("keydown", e => { if (e.code === "Escape" && recording) stop(e, true); });
 $("talk").addEventListener("contextmenu", e => e.preventDefault());
 $("typed").addEventListener("submit", e => { e.preventDefault(); const v = $("text").value.trim(); if (!v) return; if (working) { $("text").value = ""; steer(null, v); return; }
   try { ctx = ctx || new (window.AudioContext || window.webkitAudioContext)(); ctx.resume(); } catch {}
   $("text").value = ""; send(null, v); });
-$("sess").addEventListener("change", () => { store.set("voice-session", $("sess").value); showLog($("sess").value); paintBusy(); });
+$("sess").addEventListener("change", () => { store.set("voice-session", $("sess").value); showLog($("sess").value); paintBusy(); checkAsk($("sess").value); });
 // Announcements: agents speaking when you had not just asked. Each one names its session first. Only the
 // device you last talked through says it aloud; the bell turns them off on this device altogether.
 let annOn = store.get("voice-announce") !== "off", annLast = -1, annLoop = false, annEpoch = 0;
@@ -212,7 +278,7 @@ async function annListen() {
 $("ann").onclick = () => { annOn = !annOn; store.set("voice-announce", annOn ? "on" : "off"); annPaint(); annLast = -1;
   try { ctx = ctx || new (window.AudioContext || window.webkitAudioContext)(); ctx.resume(); } catch {}
   add("sys", annOn ? "Announcements on: agents can speak up by themselves on this device while this page is open." : "Announcements off on this device."); if (annOn) annListen(); };
-$("refresh").onclick = () => loadSessions().catch(e => add("err", e.message));
+$("refresh").onclick = () => loadSessions().then(() => checkAsk($("sess").value)).catch(e => add("err", e.message));
 $("save").onclick = () => { key = $("key").value.trim(); store.set("voice-key", key); $("key").value = ""; boot(); };
 async function pairFromLink() { // opened from the app's QR code: trade the one-time code for the key
   const m = /[#&]pair=([A-Za-z0-9_-]{20,80})/.exec(location.hash); if (!m) return;
@@ -222,7 +288,10 @@ async function pairFromLink() { // opened from the app's QR code: trade the one-
 }
 let pairError = "";
 async function boot() { annPaint(); await pairFromLink(); if (pairError) { $("gate").firstElementChild.textContent = pairError + " Or paste the access key."; pairError = ""; }
-  if (!key) return show(false); show(true); try { await loadSessions(); if (annOn) annListen(); add("sys", "Hold the button and talk. On a computer, hold the space bar. A typed /command is passed straight through."); } catch (e) { if (key) add("err", e.message); } }
+  if (!key) return show(false); show(true);
+  // Ask for the microphone as the page opens, not at the first hold: the question would otherwise
+  // appear under the finger and the hold would be lost.
+  try { navigator.mediaDevices?.getUserMedia({ audio: true }).then(s => { if (stream) s.getTracks().forEach(t => t.stop()); else stream = s; }).catch(() => {}); } catch {} try { await loadSessions(); checkAsk($("sess").value); if (annOn) annListen(); add("sys", "Hold the button and talk. On a computer, hold the space bar. A typed /command is passed straight through."); } catch (e) { if (key) add("err", e.message); } }
 boot();
 </script>
 </body>

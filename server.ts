@@ -2,7 +2,7 @@
 // Speech is done on this Mac by the desktop app (HerdrVoice), for the phone page too: the server hands
 // it each clip to transcribe and each reply to voice. No speech service is involved.
 import { timingSafeEqual } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 
 const ROOT = import.meta.dir;
@@ -62,7 +62,9 @@ const DEFAULT_INSTRUCTION =
   `When a [voice] request takes more than a couple of steps, also run it with one short line as you start each ` +
   `major step, so they can follow along while you work. ` +
   `When a [voice] message reaches you while you are in the middle of a task, first run it with a few words ` +
-  `that acknowledge the message, then carry on.)`;
+  `that acknowledge the message, then carry on. ` +
+  `Never answer a [voice] message with a multiple-choice question tool or any other on-screen form: ` +
+  `ask your question in plain words, on screen and with the command, and wait for the spoken answer.)`;
 const INSTRUCTION = (() => {
   const own = typeof config().instruction === "string" ? config().instruction.trim().replace(/\s+/g, " ") : "";
   const text = own || DEFAULT_INSTRUCTION;
@@ -252,6 +254,27 @@ async function status(a: Addr): Promise<string> {
   catch { return "unknown"; }
 }
 
+// ---- history: what was said, both ways -------------------------------------------------------
+// One line per message in the state file `history.jsonl` (readable by the owner only): what you said,
+// what an agent said out loud, and each permission answer. The phone page shows the recent ones for a
+// session when it opens, so a reload does not empty the conversation. It never leaves this Mac.
+// Kept to the newest 3000 lines, trimmed when the server starts. Switch it off with the word `off`
+// in the state file `history`.
+type Said = { at: number; t: string; who: "me" | "agent" | "note"; text: string; from?: string };
+const HISTORY_F = `${STATE}/history.jsonl`;
+const historyOn = () => readState("history") !== "off";
+function remember(t: string, who: Said["who"], text: string, from?: string) {
+  text = text.trim(); if (!text || !historyOn()) return;
+  try { appendFileSync(HISTORY_F, JSON.stringify({ at: Date.now(), t, who, text: text.slice(0, 4000), ...(from ? { from } : {}) }) + "\n", { mode: 0o600 }); } catch {}
+}
+function historyOf(t: string, limit: number): Said[] {
+  if (!historyOn()) return [];
+  let rows: Said[] = [];
+  try { rows = readFileSync(HISTORY_F, "utf8").split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter((r): r is Said => !!r && r.t === t); } catch {}
+  return rows.slice(-Math.max(1, Math.min(limit || 60, 300)));
+}
+try { const all = readFileSync(HISTORY_F, "utf8").split("\n").filter(Boolean); if (all.length > 3600) writeFileSync(HISTORY_F, all.slice(-3000).join("\n") + "\n", { mode: 0o600 }); } catch {}
+
 // ---- announcements: an agent speaking when nobody just asked it -----------------------------
 // Any herdr-speak line that is not the answer to a turn in progress becomes an announcement. It is
 // voiced with the session's name first ("From <session>, on <machine>. ..."), because several
@@ -283,6 +306,7 @@ async function announce(a: Addr, text: string) {
   if (!text.trim()) return;
   const who = await labelOf(a);
   push({ id: ++announceSeq, kind: "announcement", address: a.full, from: a.machine ? `${who}, on ${a.machine}` : who, text: text.trim() });
+  remember(a.full, "agent", text, a.machine ? `${who}, on ${a.machine}` : who);
   console.log(`announcement from ${a.full}`);
 }
 function push(x: Announcement) {
@@ -345,6 +369,7 @@ async function watchQueue(machine: string | null) {
       if (who && isListening(who) && rest.join(" ").trim()) {
         streamed.add(`${key}:${seen + i}`);
         push({ id: ++announceSeq, kind: "progress", address: a.full, from: "", text: rest.join(" ").trim(), target: who });
+        remember(a.full, "agent", rest.join(" "));
       }
       return; // otherwise the end of the turn delivers it
     }
@@ -396,16 +421,51 @@ async function collect(a: Addr, wantAudio = true) {
     consumed.add(`${mk}:${from + i}`); fresh.push(c.slice(1).join(" "));     // answered here, so not an announcement
   });
   const spoken = fresh.join(" ").trim();
+  remember(a.full, "agent", spoken);
   if (st !== "working") rmSync(claim(a), { force: true });
   return { status: st, spoken, narrated, audio: spoken && wantAudio ? await tts(spoken) : null, screen: await screen(a) };
 }
 
 // A session that stops at a permission prompt mid-task has not finished. Say so instead of letting the
 // client report "finished without saying anything".
-const BLOCKED = "That session is waiting on a permission prompt. Answer it in Herdr.";
-function blockedNote(res: { status: string; spoken: string }) {
+// herdr-core says what kind of stop it is (permission, question, auth) and, for a permission prompt,
+// what is being asked ("approve Bash: <command>"). That is passed on as `ask`, with speech, and
+// `ask.can` says whether it can be answered from here (see answer()). `error` carries the same words
+// for a client that does not know `ask`.
+async function detail(a: Addr): Promise<{ state: string; kind: string; msg: string; app: string }> {
+  let s: any = null; try { s = JSON.parse((await run(["hc", "get", "--json", a.full])).text()).status; } catch {}
+  const o = s && typeof s === "object" ? s : {};
+  return { state: typeof s === "string" ? s : String(o.state ?? "unknown"), kind: String(o.kind ?? ""), msg: String(o.msg ?? ""), app: String(o.app ?? "") };
+}
+const requestOf = (msg: string) => msg.replace(/^approve\s+/i, "").replace(/\s+/g, " ").trim().slice(0, 400);
+async function blockedNote(a: Addr, res: { status: string; spoken: string }, wantAudio = true) {
   if (res.status !== "blocked") return {};
-  return res.spoken ? { blocked: true } : { blocked: true, error: BLOCKED };
+  const d = await detail(a);
+  if (d.state !== "blocked") return {}; // answered in the meantime
+  const what = requestOf(d.msg);
+  const permission = d.kind === "permission";
+  const text = permission ? (what ? `It is asking for permission: ${what}` : "It is asking for permission.") : "It has stopped to ask you something. Answer it in Herdr.";
+  const can = permission && d.app === "claude-code";
+  const say = permission ? "It is asking for your permission." : text; // the request itself is shown, not read out: commands are tiresome to listen to
+  return { blocked: true, ...(res.spoken ? {} : { error: can ? text : `${text}${permission ? " Answer it in Herdr." : ""}` }),
+           ask: { text, what, can, audio: wantAudio ? await tts(say) : null, say } };
+}
+// Answer a permission prompt from the phone: Allow presses the prompt's "Yes" (key 1), Deny presses
+// Esc. Claude Code only: other agent programs' prompts take other keys. The client sends back the
+// request it was shown; if the prompt on screen is a different one by now, nothing is pressed and
+// the new request is returned instead, so nobody approves something they have not seen.
+async function answer(a: Addr, choice: string, shown: string, wantAudio = true) {
+  if (choice !== "allow" && choice !== "deny") return { answered: false, error: "Say allow or deny." };
+  const d = await detail(a);
+  if (d.state !== "blocked" || d.kind !== "permission") return { answered: false, error: "That session is not waiting for permission any more." };
+  if (d.app !== "claude-code") return { answered: false, error: "Answering from here is only known to work for Claude Code sessions. Answer it in Herdr." };
+  if (requestOf(d.msg) !== shown) return { answered: false, changed: true, ...(await blockedNote(a, { status: "blocked", spoken: "" }, wantAudio)) };
+  const k = await run(["hc", "keys", "--json", a.full, choice === "allow" ? "1" : "esc"]);
+  if (k.code !== 0) return { answered: false, error: "Could not press the key in that session." };
+  console.log(`permission ${choice === "allow" ? "allowed" : "denied"} for ${a.full}: ${shown.slice(0, 120)}`);
+  remember(a.full, "note", `${choice === "allow" ? "Allowed" : "Denied"}: ${shown}`);
+  await Bun.sleep(700);
+  return { answered: true, choice, status: await status(a) };
 }
 
 // spokenText: the words came from speech the client had transcribed first (/api/hear), so a leading
@@ -419,11 +479,16 @@ async function turn(a: Addr, audio: Uint8Array | null, typed = "", wantAudio = t
   }
   if (!heard) return { heard: "", error: "I didn't catch anything." };
   if (!audio && !spokenText && /^\/[a-z][\w:-]*( |$)/i.test(heard)) return command(a, heard);
-  if ((await status(a)) === "blocked") return { heard, error: "That session is waiting on a permission prompt. Answer it in Herdr first." };
+  // Already stopped at a prompt: nothing can be typed into it. Hand the pending request back so it
+  // can be answered, and say that these words were not delivered.
+  if ((await status(a)) === "blocked")
+    return { heard, status: "blocked", spoken: "", ...(await blockedNote(a, { status: "blocked", spoken: "" }, wantAudio)),
+             note: "Your message was not sent: the session is waiting for an answer first." };
   await ensureSpeak(a.machine);
   cursor.set(a.full, await queueLen(a));
   writeFileSync(claim(a), "");
   const msg = primed.has(a.full) ? `[voice] ${heard}` : `[voice] ${heard}  ${INSTRUCTION}`;
+  remember(a.full, "me", heard);
   const s = await run(["hc", "send", "--wait", "--timeout", String(TURN_WAIT), "--json", a.full, msg], undefined, (TURN_WAIT + 20) * 1000);
   let sent: any = {}; try { sent = JSON.parse(s.text()); } catch {}
   const res = await collect(a, wantAudio);
@@ -431,7 +496,7 @@ async function turn(a: Addr, audio: Uint8Array | null, typed = "", wantAudio = t
   // reason, not because the session forgot the instruction.
   if (res.spoken || res.narrated) primed.add(a.full); else if (res.status !== "working" && res.status !== "blocked") primed.delete(a.full);
   try { writeFileSync(PRIMED_F, JSON.stringify([...primed])); } catch {}
-  return { heard, ...res, ...blockedNote(res), note: s.code !== 0 ? (sent.error ?? s.err.trim().slice(0, 200)) : undefined };
+  return { heard, ...res, ...(await blockedNote(a, res, wantAudio)), note: s.code !== 0 ? (sent.error ?? s.err.trim().slice(0, 200)) : undefined };
 }
 
 // A typed slash command (/compact, /clear, /model ...) is typed into the session key by key, exactly
@@ -445,6 +510,7 @@ async function command(a: Addr, text: string) {
   const keys = [...text].map(c => (c === " " ? "space" : c));
   const typed = await run(["hc", "keys", "--json", a.full, ...keys]);
   if (typed.code !== 0) return { heard: text, command: true, error: "Could not type into that session." };
+  remember(a.full, "me", text);
   await Bun.sleep(300);
   await run(["hc", "keys", "--json", a.full, "enter"]);
   await run(["hc", "wait", "--timeout", "30", a.full], undefined, 40000);
@@ -464,6 +530,7 @@ async function steer(a: Addr, audio: Uint8Array | null, typed: string, client: s
   const s = await run(["hc", "send", "--json", a.full, primed.has(a.full) ? `[voice] ${heard}` : `[voice] ${heard}  ${INSTRUCTION}`], undefined, 70000);
   if (s.code !== 0) return { heard, error: "Could not reach that session to steer it." };
   turnClient.set(a.full, client); talkedThrough(client); // narration now follows the device that steered
+  remember(a.full, "me", heard);
   return { heard, steered: true, status: "working" };
 }
 // Send now: a steering message waits in the agent's own queue until its current step ends. Claude Code
@@ -550,9 +617,27 @@ const listen = (hostname: string) => Bun.serve({
       }
       const a = parseAddr(u.searchParams.get("t") ?? "");
       if (!a || (a.machine && !(await machines()).has(a.machine))) return json({ error: "unknown session" }, 400);
-      if (req.method === "GET" && u.pathname === "/api/screen") return json({ status: await status(a), screen: await screen(a) });
+      if (req.method === "GET" && u.pathname === "/api/screen") { // also says what a stopped session is waiting for, so a page that was reloaded can show it again
+        const st = await status(a);
+        return json({ status: st, screen: await screen(a), ...(st === "blocked" ? await blockedNote(a, { status: "blocked", spoken: "" }, false) : {}) });
+      }
+      if (req.method === "GET" && u.pathname === "/api/history") return json({ items: historyOf(a.full, Number(u.searchParams.get("limit") ?? 60)) });
       if (req.method === "POST" && u.pathname === "/api/stop") return json(await stopTask(a));
       if (req.method === "POST" && u.pathname === "/api/now") return json(await sendNow(a));
+      if (req.method === "POST" && u.pathname === "/api/answer") {
+        let shown = ""; try { shown = String((await req.json()).what ?? ""); } catch {}
+        // Allowing lets the task go on, and its first spoken line can land before the client's next
+        // collect arrives. Count the task as in progress from the moment of the answer, so that line is
+        // the reply (or narration for this device) and not, as well, an announcement.
+        const allow = u.searchParams.get("choice") === "allow", was = busy.has(a.full);
+        if (allow && !was) { busy.add(a.full); if (!turnClient.has(a.full)) turnClient.set(a.full, clientId); }
+        const r: any = await answer(a, u.searchParams.get("choice") ?? "", shown, wantAudio);
+        if (allow && !was) {
+          if (r.answered && !inflight.has(a.full)) { clearTimeout(lingering.get(a.full)); lingering.set(a.full, setTimeout(() => endTask(a.full), LINGER_MS)); }
+          else if (!r.answered) endTask(a.full);
+        }
+        return json(r);
+      }
       const isTurn = req.method === "POST" && (u.pathname === "/api/turn" || u.pathname === "/api/say");
       const isCollect = req.method === "POST" && u.pathname === "/api/collect";
       if (!isTurn && !isCollect) return json({ error: "not found" }, 404);
@@ -577,7 +662,7 @@ const listen = (hostname: string) => Bun.serve({
           if (!turnClient.has(a.full)) turnClient.set(a.full, clientId);
           await run(["hc", "wait", "--timeout", "120", a.full], undefined, 130000);
           res = await collect(a, wantAudio);
-          res = { ...res, ...blockedNote(res) };
+          res = { ...res, ...(await blockedNote(a, res, wantAudio)) };
         }
         return json(res);
       } finally {

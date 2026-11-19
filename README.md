@@ -88,7 +88,11 @@ compacted, the instruction is sent again.
   that was running continues in the background.
 - **Stop.** A quick tap on the app's button, a double tap of its shortcut, or the Stop button on the
   phone page.
-- **Permission prompts.** If the agent stops at a permission prompt mid-task, you are told so.
+- **Permission prompts.** If the agent stops at a permission prompt mid-task, you hear that it is
+  asking and see what for. On the phone page, for Claude Code sessions, **Allow** and **Deny** buttons answer it.
+  It takes a tap, never a spoken word, so a misheard word cannot approve a command; and if the
+  request on the agent's screen has changed since you were shown it, nothing is pressed and you are
+  shown the new one.
 - **Announcements.** An agent can speak when you have not just asked it something, for example when
   a long job finishes. It names its session first. Only the device you last talked through says it
   aloud; other open devices show the text. Each device can switch announcements off.
@@ -102,6 +106,18 @@ Spoken text is tidied before it is shown or sent: the fillers `um`, `uh`, `er`, 
 are dropped, and a word or short phrase said twice in a row is kept once. Numbers, "mm", hyphenated
 sounds such as "uh-huh", and anything you type are left alone. It is two rules, not a model. Switch
 it off with `echo off > ~/.local/state/herdr-voice/compact`.
+
+## What is kept
+
+The server keeps a history on the Mac of what was said both ways: your words, what agents said out
+loud, and each permission answer. It is the file `~/.local/state/herdr-voice/history.jsonl`, readable
+by you only, trimmed to the newest 3000 lines, and it never leaves the Mac. The phone page shows the
+recent messages of a session when you open it, so a reload does not empty the conversation. Switch
+it off with `echo off > ~/.local/state/herdr-voice/history`; delete the file to forget what is there.
+
+No audio is kept on purpose. Three files hold the most recent clip of their kind and are overwritten
+by the next one: the app's last recording and the last phone clip it transcribed (both in the Mac's
+temporary folder), and the last clip the server could not decode (in the state folder).
 
 ## The phone page
 
@@ -180,8 +196,8 @@ permission prompts. Treat the access key like a shell login.
 - The access key is in `~/.local/state/herdr-voice/psk`, compared in constant time.
 - The certificate authority can only vouch for the addresses the server listens on, and its signing
   key is deleted at creation, so it can never sign anything else.
-- The page can list sessions, send text to one, press its stop and send-now keys, and read its
-  screen and spoken lines. It cannot start sessions or touch files.
+- The page can list sessions, send text to one, press its stop and send-now keys, answer its
+  permission prompts, and read its screen and spoken lines. It cannot start sessions or touch files.
 - Words are typed into a session without a sender tag, as if you had typed them.
 
 ## Known limits
