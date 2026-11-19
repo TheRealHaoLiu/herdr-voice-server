@@ -1,0 +1,16 @@
+#!/bin/bash
+# herdr-speakd: speak this machine's herdr-speak queue aloud with macOS `say`.
+# Optional. Lines from a session that is mid-turn with the phone page are skipped, so nothing is heard twice.
+set -uo pipefail
+d="${HERDR_VOICE_DIR:-/tmp/herdr-voice}"
+state="${HERDR_VOICE_STATE:-$HOME/.local/state/herdr-voice}"
+mkdir -p -m 700 "$d"; touch "$d/outbox.tsv"
+trap 'pkill -P $$ 2>/dev/null; exit 0' INT TERM   # take the tail and the reader loop down with us
+echo "herdr-speakd ready, watching $d/outbox.tsv"
+tail -n0 -F "$d/outbox.tsv" | while IFS=$'\t' read -r t text; do
+  [ -n "${text:-}" ] || continue
+  if [ -e "$state/claims/$t" ]; then echo "[$t] (phone turn, not spoken here) $text"; continue; fi
+  echo "[$t] $text"
+  printf '%s' "$text" | say -f -
+done &
+wait $!   # the loop runs in the background so the trap above can fire as soon as a stop signal arrives

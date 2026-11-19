@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Voice</title>
+<style>
+  :root { --bg:#101214; --panel:#1a1d21; --line:#2a2f36; --ink:#e8eaed; --dim:#8b939e; --accent:#e0823d; --ok:#5fb58a; --bad:#e06a5f; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--ink); font:16px/1.45 -apple-system,system-ui,sans-serif; }
+  body { display:flex; flex-direction:column; padding:max(12px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom)); gap:12px; }
+  header { display:flex; gap:8px; align-items:center; }
+  select { flex:1; min-width:0; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:11px 10px; font-size:16px; }
+  button.small { background:var(--panel); color:var(--dim); border:1px solid var(--line); border-radius:10px; padding:11px 12px; font-size:15px; }
+  #logs { flex:1; min-height:0; display:flex; }
+  .log { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:2px; }
+  .row { border-radius:12px; padding:10px 12px; max-width:92%; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .me { align-self:flex-end; background:#2b3440; }
+  .said { align-self:flex-start; background:var(--panel); border-left:3px solid var(--accent); }
+  .sys { align-self:center; color:var(--dim); font-size:14px; text-align:center; }
+  .err { align-self:center; color:var(--bad); font-size:14px; text-align:center; }
+  details { align-self:stretch; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:8px 10px; }
+  details summary { color:var(--dim); font-size:14px; }
+  details pre { margin:8px 0 0; font:11px/1.35 ui-monospace,Menlo,monospace; overflow-x:auto; white-space:pre; color:#c9ced6; }
+  #talk { flex:none; height:112px; border-radius:22px; border:0; background:var(--accent); color:#1b1206; font-size:21px; font-weight:650;
+          user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; touch-action:none; }
+  #stop { flex:none; background:var(--panel); color:var(--bad); border:1px solid var(--bad); border-radius:14px; padding:12px; font-size:16px; font-weight:600; }
+  #talk.rec { background:var(--bad); color:#fff; transform:scale(.98); }
+  #talk:disabled { background:#3a3f47; color:var(--dim); }
+  #gate { display:flex; flex-direction:column; gap:10px; margin:auto 0; }
+  #gate input { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:12px; font-size:16px; }
+  #gate button { background:var(--accent); border:0; border-radius:10px; padding:12px; font-size:17px; font-weight:600; }
+  #typed { display:flex; gap:8px; }
+  #typed input { flex:1; min-width:0; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:11px 10px; font-size:16px; }
+  #ann[aria-pressed="true"] { color:var(--accent); border-color:var(--accent); }
+  .ann { align-self:flex-start; background:var(--panel); border-left:3px solid var(--ok); }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<div id="gate" hidden>
+  <div>Paste the access key once. It stays on this phone.</div>
+  <input id="key" type="password" autocomplete="off" autocapitalize="off" placeholder="Access key">
+  <button id="save">Continue</button>
+</div>
+<header id="top" hidden>
+  <select id="sess" aria-label="Session"></select>
+  <button class="small" id="refresh" aria-label="Refresh sessions">↻</button>
+  <button class="small" id="ann" aria-pressed="false" title="Let agents speak up by themselves on this device">🔔</button>
+</header>
+<div id="logs" hidden></div>
+<form id="typed" hidden><input id="text" type="text" autocomplete="off" placeholder="Type, dictate, or /command" enterkeyhint="send"><button class="small" id="go">Send</button></form>
+<button id="stop" hidden>Stop the task</button>
+<button id="talk" hidden disabled>Hold to talk</button>
+<script>
+const $ = id => document.getElementById(id);
+const store = { get(k){ try { return localStorage.getItem(k); } catch { return null; } }, set(k,v){ try { localStorage.setItem(k,v); } catch {} } };
+let key = store.get("voice-key") || "";
+let clientId = store.get("voice-client"); if (!clientId) { clientId = "page-" + Math.random().toString(36).slice(2, 12); store.set("voice-client", clientId); }
+let ctx, stream, rec, chunks = [], recording = false, working = false;
+
+const logs = new Map(); // one chat history per session; only the selected session's is visible
+function logFor(t) { if (!logs.has(t)) { const d = document.createElement("div"); d.className = "log"; d.hidden = true; $("logs").append(d); logs.set(t, d); } return logs.get(t); }
+function showLog(t) { for (const [k, d] of logs) d.hidden = k !== t; const d = logFor(t); d.hidden = false; d.lastElementChild?.scrollIntoView({block:"end"}); }
+function add(cls, text, t = $("sess").value) { const d = document.createElement("div"); d.className = "row " + cls; d.textContent = text; logFor(t).append(d); d.scrollIntoView({block:"end"}); return d; }
+function addScreen(text, t) { if (!text) return; const d = document.createElement("details"); const s = document.createElement("summary"); s.textContent = "What it wrote on screen"; const p = document.createElement("pre"); p.textContent = text; d.append(s, p); logFor(t).append(d); d.scrollIntoView({block:"end"}); }
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), "x-voice-key": key, "x-voice-client": clientId } });
+  if (r.status === 401) { key = ""; store.set("voice-key", ""); show(false); throw new Error("That key was not accepted."); }
+  const j = await r.json(); if (!r.ok && j.error) throw new Error(j.error); return j;
+}
+function show(ok) { if (!ok) $("stop").hidden = true;
+  for (const id of ["top","logs","typed","talk"]) $(id).hidden = !ok; $("gate").hidden = ok; }
+function ago(ms) { if (!ms) return ""; const m = Math.round((Date.now() - ms) / 60000); return m < 1 ? "now" : m < 60 ? m + "m ago" : m < 1440 ? Math.round(m / 60) + "h ago" : Math.round(m / 1440) + "d ago"; }
+function label(s) { const what = s.name || s.title || s.folder || s.address; const bits = [s.title && s.name ? null : (s.title ? s.folder : null), s.status === "working" ? "working" : s.status === "blocked" ? "needs you" : ago(s.active_ms)].filter(Boolean); return what + (bits.length ? "  ·  " + bits.join(" · ") : ""); }
+async function loadSessions() {
+  const keep = $("sess").value || store.get("voice-session");
+  const { sessions } = await api("/api/sessions");
+  const groups = new Map();
+  for (const s of sessions) { if (!groups.has(s.machine)) groups.set(s.machine, []); groups.get(s.machine).push(s); }
+  $("sess").replaceChildren(...[...groups].map(([m, list]) => { const g = document.createElement("optgroup"); g.label = m;
+    g.append(...list.map(s => { const o = document.createElement("option"); o.value = s.address; o.textContent = label(s); return o; })); return g; }));
+  if (keep && sessions.some(s => s.address === keep)) $("sess").value = keep;
+  $("talk").disabled = !sessions.length;
+  if ($("sess").value) showLog($("sess").value);
+}
+// Everything spoken goes through one volume control, so it can be turned down while you hold the button.
+let gain = null;
+function out() { if (!gain) { gain = ctx.createGain(); gain.connect(ctx.destination); } return gain; }
+function duck(on) { if (!ctx) return; try { out().gain.setTargetAtTime(on ? 0.12 : 1, ctx.currentTime, 0.04); } catch {} }
+let playChain = Promise.resolve();
+function play(b64) { // clips play one at a time, in the order they arrived
+  if (!b64 || !ctx) return Promise.resolve();
+  const run = async () => {
+    const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const buf = await ctx.decodeAudioData(bin.buffer);
+    await new Promise(done => { const src = ctx.createBufferSource(); src.buffer = buf; src.connect(out()); src.onended = done; src.start(); });
+  };
+  const p = playChain.then(run); playChain = p.catch(() => {}); return p;
+}
+const workingOn = new Set(); // sessions with a task in progress; the button reflects the selected one
+function paintBusy(text) { working = workingOn.has($("sess").value); $("stop").hidden = !working; $("talk").textContent = working ? "Hold to steer" : (text || "Hold to talk"); }
+function setBusy(b, text, t = $("sess").value) { if (b) workingOn.add(t); else workingOn.delete(t); paintBusy(text); }
+let steering = false;
+// Words while you talk: while the button is held, the recording so far is transcribed about once a
+// second and shown in a faded bubble. On release the whole clip is transcribed once more and that
+// text, shown in the same bubble, is what gets sent. A failed in-between attempt is simply skipped.
+const LIVE = !/[#&]nolive\b/.test(location.hash); // on by default; add #nolive to the address to switch it off
+let live = null, liveGen = 0, liveBusy = false, liveTimer = 0;
+function liveTick(t, gen) {
+  if (liveBusy || !recording || gen !== liveGen || !chunks.length) return;
+  liveBusy = true;
+  const blob = new Blob(chunks, { type: rec.mimeType });
+  api("/api/hear", { method: "POST", headers: { "content-type": blob.type || "audio/mp4" }, body: blob })
+    .then(h => { if (gen !== liveGen || !h.heard) return; if (!live) { live = add("me", "", t); live.style.opacity = ".55"; } live.textContent = h.heard + " …"; live.scrollIntoView({block:"end"}); })
+    .catch(() => {}).finally(() => { liveBusy = false; });
+}
+function dropLive() { live?.remove(); live = null; }
+async function hear(blob, t) { // speech to text first, so your words show at once, before the agent has answered
+  let h; try { h = await api("/api/hear", { method: "POST", headers: { "content-type": blob.type || "audio/mp4" }, body: blob }); } catch (e) { dropLive(); throw e; }
+  if (!h.heard) { dropLive(); add("err", h.error || "I didn't catch anything.", t); return null; }
+  const d = live || add("me", "", t); live = null; d.style.opacity = ""; d.textContent = h.heard; return h.heard;
+}
+async function steer(blob, typed) { // sent while the agent is mid-task: goes into the running task
+  const t = $("sess").value;
+  try {
+    const spoken = blob ? await hear(blob, t) : null; if (blob && !spoken) return;
+    const j = await api("/api/say?t=" + encodeURIComponent(t) + (spoken ? "&spoken=1" : ""), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: spoken || typed }) });
+    if (j.heard && !spoken) add("me", j.heard, t);
+    if (j.error) { add("err", j.error, t); return; }
+    // The words wait until the agent's current step ends. "Send now" has it read them at once.
+    const row = add("sys", "Sent mid-task. It reads this when its current step ends. ", t);
+    const b = document.createElement("button"); b.className = "small"; b.textContent = "Send now"; row.append(b);
+    b.onclick = async () => { b.disabled = true;
+      try { const r = await api("/api/now?t=" + encodeURIComponent(t), { method: "POST" }); row.textContent = r.sent ? "Sent mid-task, and pushed through now." : "Sent mid-task. " + (r.error || "Could not push it through."); }
+      catch (e) { row.textContent = "Sent mid-task. " + e.message; } };
+  } catch (e) { add("err", e.message, t); }
+}
+$("stop").onclick = async () => { const t = $("sess").value; playChain = Promise.resolve();
+  try { const j = await api("/api/stop?t=" + encodeURIComponent(t), { method: "POST" }); add("sys", j.stopped ? "Stopped." : "Could not stop it.", t); } catch (e) { add("err", e.message, t); } };
+function showResult(j, t) {
+  if (j.error) add("err", j.error, t);
+  if (j.spoken) add("said", j.spoken, t); else if (!j.error && !j.command && !j.narrated && j.status !== "working") add("sys", "It finished without saying anything.", t);
+  addScreen(j.screen, t);
+  if (j.note) add("sys", j.note, t);
+  if (j.spoken && !j.audio) return phoneSpeak(j.spoken);
+  return play(j.audio).catch(() => phoneSpeak(j.spoken));
+}
+function phoneSpeak(text) { try { if (text && window.speechSynthesis) speechSynthesis.speak(new SpeechSynthesisUtterance(text)); } catch {} }
+async function send(blob, typed) {
+  const t = $("sess").value; store.set("voice-session", t);
+  setBusy(true, typed ? "Sending…" : "Listening to that…", t);
+  try {
+    const spoken = blob ? await hear(blob, t) : null; if (blob && !spoken) { setBusy(false, undefined, t); return; }
+    let j = await api("/api/say?t=" + encodeURIComponent(t) + (spoken ? "&spoken=1" : ""), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: spoken || typed }) });
+    if (j.heard && !spoken) add("me", j.heard, t);
+    await showResult(j, t);
+    while (j.status === "working") { setBusy(true, "Still working…", t); j = await api("/api/collect?t=" + encodeURIComponent(t), { method: "POST" }); await showResult(j, t); }
+  } catch (e) { add("err", e.message, t); }
+  setBusy(false, undefined, t);
+}
+async function start(e) {
+  e.preventDefault(); if (recording) return; steering = working;
+  try {
+    ctx = ctx || new (window.AudioContext || window.webkitAudioContext)(); if (ctx.state !== "running") await ctx.resume();
+    duck(true); // quieter while you talk
+    stream = stream || await navigator.mediaDevices.getUserMedia({ audio: true });
+    chunks = []; rec = new MediaRecorder(stream);
+    rec.ondataavailable = ev => ev.data.size && chunks.push(ev.data);
+    rec.onstop = () => { const blob = new Blob(chunks, { type: rec.mimeType });
+      if (blob.size <= 2500) dropLive();
+      if (steering) { $("talk").textContent = "Hold to steer"; if (blob.size > 2500) steer(blob); }
+      else if (blob.size > 2500) send(blob); else setBusy(false); };
+    dropLive(); const gen = ++liveGen, t = $("sess").value;
+    // An iPhone hands over a recording made in pieces with its header second; the server puts it first.
+    if (LIVE) rec.start(1000); else rec.start(); recording = true;
+    clearInterval(liveTimer); if (LIVE) liveTimer = setInterval(() => liveTick(t, gen), 1000); $("talk").classList.add("rec"); $("talk").textContent = "Listening…";
+  } catch (err) { duck(false); add("err", "Microphone not available: " + err.message); }
+}
+function stop(e) { e.preventDefault(); duck(false); if (!recording) return; recording = false; clearInterval(liveTimer); liveGen++; $("talk").classList.remove("rec"); if (!steering) setBusy(true); rec.stop(); }
+$("talk").addEventListener("pointerdown", start);
+for (const ev of ["pointerup","pointercancel","pointerleave"]) $("talk").addEventListener(ev, stop);
+const typing = () => ["INPUT","SELECT","TEXTAREA"].includes(document.activeElement?.tagName);
+addEventListener("keydown", e => { if (e.code === "Space" && !e.repeat && !typing() && !$("talk").hidden) start(e); else if (e.code === "Space" && !typing()) e.preventDefault(); });
+addEventListener("keyup", e => { if (e.code === "Space" && !typing()) stop(e); });
+$("talk").addEventListener("contextmenu", e => e.preventDefault());
+$("typed").addEventListener("submit", e => { e.preventDefault(); const v = $("text").value.trim(); if (!v) return; if (working) { $("text").value = ""; steer(null, v); return; }
+  try { ctx = ctx || new (window.AudioContext || window.webkitAudioContext)(); ctx.resume(); } catch {}
+  $("text").value = ""; send(null, v); });
+$("sess").addEventListener("change", () => { store.set("voice-session", $("sess").value); showLog($("sess").value); paintBusy(); });
+// Announcements: agents speaking when you had not just asked. Each one names its session first. Only the
+// device you last talked through says it aloud; the bell turns them off on this device altogether.
+let annOn = store.get("voice-announce") !== "off", annLast = -1, annLoop = false, annEpoch = 0;
+function annPaint() { $("ann").setAttribute("aria-pressed", annOn ? "true" : "false"); }
+async function annListen() {
+  if (annLoop) return; annLoop = true;
+  while (annOn && key) {
+    try {
+      const j = await api("/api/announcements?after=" + annLast + "&wait=25");
+      // First call: start from now. Server restarted (its numbering began again): take everything it has said since.
+      if (annLast < 0 || j.epoch !== annEpoch) { annLast = annEpoch && j.epoch !== annEpoch ? 0 : j.last; annEpoch = j.epoch; continue; }
+      for (const x of j.items) { annLast = Math.max(annLast, x.id);
+        if (x.kind === "progress") { add("said", x.text, x.address); if (x.audio) play(x.audio).catch(() => phoneSpeak(x.text)); else phoneSpeak(x.text); continue; } // narration during a turn
+        add("ann", "From " + x.from + ": " + x.text);
+        if (!x.play) continue; // another device is the one you last talked through; show it here silently
+        if (x.audio) await play(x.audio).catch(() => phoneSpeak("From " + x.from + ". " + x.text)); else phoneSpeak("From " + x.from + ". " + x.text); }
+    } catch { await new Promise(r => setTimeout(r, 3000)); }
+  }
+  annLoop = false;
+}
+$("ann").onclick = () => { annOn = !annOn; store.set("voice-announce", annOn ? "on" : "off"); annPaint(); annLast = -1;
+  try { ctx = ctx || new (window.AudioContext || window.webkitAudioContext)(); ctx.resume(); } catch {}
+  add("sys", annOn ? "Announcements on: agents can speak up by themselves on this device while this page is open." : "Announcements off on this device."); if (annOn) annListen(); };
+$("refresh").onclick = () => loadSessions().catch(e => add("err", e.message));
+$("save").onclick = () => { key = $("key").value.trim(); store.set("voice-key", key); $("key").value = ""; boot(); };
+async function pairFromLink() { // opened from the app's QR code: trade the one-time code for the key
+  const m = /[#&]pair=([A-Za-z0-9_-]{20,80})/.exec(location.hash); if (!m) return;
+  history.replaceState(null, "", location.pathname);
+  try { const r = await fetch("/api/pair", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: m[1] }) });
+    const j = await r.json(); if (j.key) { key = j.key; store.set("voice-key", key); } else pairError = j.error || "Pairing failed."; } catch { pairError = "Pairing failed."; }
+}
+let pairError = "";
+async function boot() { annPaint(); await pairFromLink(); if (pairError) { $("gate").firstElementChild.textContent = pairError + " Or paste the access key."; pairError = ""; }
+  if (!key) return show(false); show(true); try { await loadSessions(); if (annOn) annListen(); add("sys", "Hold the button and talk. On a computer, hold the space bar. A typed /command is passed straight through."); } catch (e) { if (key) add("err", e.message); } }
+boot();
+</script>
+</body>
+</html>

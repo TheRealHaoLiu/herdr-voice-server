@@ -1,0 +1,101 @@
+#!/bin/bash
+# herdr-voice start|stop|restart|status|check|app|key|voice <name>|port <number>|mode local|network|pin-home <name>|run
+# Starts the server by hand, in the background, as hc terminals. Nothing starts at login.
+set -euo pipefail
+self="$0"; while [ -L "$self" ]; do self="$(readlink "$self")"; done
+repo="$(cd "$(dirname "$self")/.." && pwd)"
+state="${HERDR_VOICE_STATE:-$HOME/.local/state/herdr-voice}"
+# Mode: "local" (default) = the server listens on this Mac only; "network" = also on this computer's
+# network address, for phones. State file `mode`; set here or in the app's Setup.
+mode="${HERDR_VOICE_MODE:-$(cat "$state/mode" 2>/dev/null || true)}"; [ "$mode" = network ] || mode=local
+lan="$(cat "$state/address" 2>/dev/null || true)"
+# What this needs. herdr-core (hc) is the hard one: every session it talks to lives in an hc terminal.
+have() { command -v "$1" >/dev/null 2>&1; }
+check() {
+  local bad=0
+  if have hc; then echo "hc (herdr-core): found, $(hc --version 2>/dev/null | head -1)"; else echo "hc (herdr-core): NOT FOUND. herdr-voice talks to agent sessions through it; install herdr-core first."; bad=1; fi
+  if have bun; then echo "bun: found"; else echo "bun: NOT FOUND. The server runs on it."; bad=1; fi
+  if have openssl; then echo "openssl: found"; else echo "openssl: NOT FOUND. It makes the certificate."; bad=1; fi
+  if have ffmpeg; then echo "ffmpeg: found"; else echo "ffmpeg: not found. Only the phone page needs it."; fi
+  return $bad
+}
+needs() { have hc && have bun && have openssl || { check >&2 || true; exit 1; }; }
+# The port is a setting kept in the state folder (`herdr-voice port <number>`); the server and the app read the same file.
+port="${HERDR_VOICE_PORT:-$(cat "$state/port" 2>/dev/null || true)}"; port="${port:-8443}"
+# Home check (optional): after `herdr-voice pin-home <name>`, the server only runs while the home
+# router's DNS gives the pinned answer for that name. Pick a name only your own network knows; a public
+# network's router will not know it. Without a pin there is no check. (A hardware-address lookup was
+# tried first and dropped: on macOS it came back empty from background terminals.)
+# Pin file: "<router> <name> <answer>".
+router="${HERDR_VOICE_ROUTER:-$(awk '{print $1}' "$state/home" 2>/dev/null || true)}"
+[ -n "$router" ] || router="$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')"
+name="$(awk '{print $2}' "$state/home" 2>/dev/null || true)"; name="${name:-${HERDR_VOICE_HOME_NAME:-}}"
+ask() { dig +short +time=2 +tries=1 "@$router" "$name" A 2>/dev/null | head -1; }
+at_home() { [ -s "$state/home" ] || return 0; want="$(awk '{print $3}' "$state/home")" && [ -n "$want" ] && [ "$(ask)" = "$want" ]; }
+up() { hc get --json "$1" 2>/dev/null | grep -q '"state":"live"'; }
+drop() { hc kill "$1" >/dev/null 2>&1 || true; hc rm "$1" >/dev/null 2>&1 || true; }
+# A copy started outside hc (by the desktop app) records its process id; stop it by that.
+alive() { [ -s "$state/$1.pid" ] && kill -0 "$(cat "$state/$1.pid")" 2>/dev/null; }
+droppid() { if alive "$1"; then kill "$(cat "$state/$1.pid")" 2>/dev/null || true; fi; rm -f "$state/$1.pid"; }
+answering() { nc -z -G1 127.0.0.1 "$port" >/dev/null 2>&1; }
+where() { if [ "$mode" = network ] && [ -n "$lan" ]; then echo "https://127.0.0.1:$port/ and, for phones, https://$lan:$port/"; else echo "https://127.0.0.1:$port/ (this Mac only)"; fi; }
+# The home check only matters when phones can reach the server.
+home_ok() { [ "$mode" = local ] || at_home; }
+
+case "${1:-}" in
+  pin-home)
+    name="${2:-$name}"; [ -n "$name" ] || { echo "usage: herdr-voice pin-home <a name only your home network's DNS knows>" >&2; exit 2; }
+    ans="$(ask)"; [ -n "$ans" ] || { echo "The router at $router did not answer for $name. Are you on the home network?" >&2; exit 1; }
+    mkdir -p "$state"; echo "$router $name $ans" > "$state/home"; echo "Home pinned: router $router answers $name -> $ans." ;;
+  start)
+    needs; "$repo/bin/setup" >/dev/null
+    if alive server; then echo "Already running inside the desktop app."; exit 0; fi
+    home_ok || { echo "Not starting: phones are switched on and this does not look like the home network (router $router did not match)." >&2; exit 1; }
+    if up herdr-voice; then echo "Already running."; else
+      hc run --bg --outlive-parent --no-notify --name herdr-voice --cwd "$repo" bash bin/herdr-voice run >/dev/null
+      hc wait herdr-voice --output "herdr-voice ready" --timeout 20 >/dev/null 2>&1 || true
+    fi
+    up herdr-speakd || hc run --bg --outlive-parent --no-notify --name herdr-speakd --cwd "$repo" bash bin/herdr-speakd >/dev/null
+    up herdr-voice && echo "Running: $(where)" || { echo "It did not come up. See: hc read herdr-voice" >&2; exit 1; } ;;
+  run)  # foreground: the server plus the home check that stops it. `start` runs this in an hc terminal.
+    needs
+    home_ok || { echo "phones are switched on and this is not the home network: refusing to run" >&2; exit 1; }
+    "$repo/bin/setup"; lan="$(cat "$state/address" 2>/dev/null || true)"
+    echo $$ > "$state/server.pid"
+    cd "$repo"; bun run server.ts & pid=$!
+    trap 'kill "$pid" 2>/dev/null; rm -f "$state/server.pid"' EXIT
+    trap 'exit 0' INT TERM
+    misses=0
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep "${HERDR_VOICE_CHECK_SECS:-30}" & wait $! || true
+      if home_ok; then misses=0; else misses=$((misses + 1)); fi
+      if [ "$misses" -ge 2 ]; then echo "left the home network: stopping"; break; fi
+    done ;;
+  speaker)  # foreground: the laptop speaker. The desktop app runs this as its own child.
+    echo $$ > "$state/speaker.pid"; exec bash "$repo/bin/herdr-speakd" ;;
+  stop) drop herdr-voice; drop herdr-speakd; droppid server; droppid speaker; echo "Stopped." ;;
+  restart) "$self" stop >/dev/null; sleep 1; "$self" start ;;
+  status)
+    if up herdr-voice; then echo "Server: running at $(where) (hc terminal)"
+    elif alive server; then echo "Server: running at $(where) (inside the desktop app)"
+    elif answering; then echo "Server: something is answering at https://127.0.0.1:$port/, not started by this command"
+    else echo "Server: stopped"; fi
+    if up herdr-speakd || alive speaker; then echo "Laptop speaker: running"; else echo "Laptop speaker: stopped"; fi
+    if [ "$mode" = local ]; then echo "Phones: off (this Mac only)"; else echo "Phones: on"; fi
+    if [ "$mode" = local ]; then :; elif [ ! -s "$state/home" ]; then echo "Network: no home check set"; elif at_home; then echo "Network: home"; else echo "Network: not home (the server will not run here)"; fi
+    echo "Voice: $(cat "$state/voice" 2>/dev/null || echo am_echo)" ;;
+  check) check ;;
+  mode) [ "${2:-}" = local ] || [ "${2:-}" = network ] || { echo "usage: herdr-voice mode local|network  (now: $mode)" >&2; exit 2; }
+    mkdir -p "$state"; echo "$2" > "$state/mode"
+    if [ "$2" = network ]; then echo "Phones switched on. Restart the server or the app; a certificate that also names this computer's network address is made if needed."
+    else echo "Phones switched off: after a restart the server listens on this Mac only."; fi ;;
+  app) needs; [ -d "$HOME/Applications/HerdrVoice.app" ] || "$repo/mac/build.sh"
+    open "$HOME/Applications/HerdrVoice.app"; echo "HerdrVoice is open: hold the floating button, or Option+Command by themselves, to talk." ;;
+  key) pbcopy < "$state/psk"; echo "Access key copied to the clipboard." ;;
+  voice) [[ "${2:-}" =~ ^[a-z]{2}_[a-z0-9_]{2,30}$ ]] || { echo "usage: herdr-voice voice <name, e.g. am_echo>" >&2; exit 2; }
+    echo "$2" > "$state/voice"; echo "Voice set to $2." ;;
+  port) [[ "${2:-}" =~ ^[0-9]{4,5}$ ]] && [ "$2" -ge 1024 ] && [ "$2" -le 65534 ] || { echo "usage: herdr-voice port <number from 1024 to 65534>  (now: $port)" >&2; exit 2; }
+    mkdir -p "$state"; echo "$2" > "$state/port"
+    echo "Port set to $2 (certificate download on $(( $2 + 1 ))). Restart the server or the app to use it; each phone then needs the new address and the access key again." ;;
+  *) echo "usage: herdr-voice start|stop|restart|status|check|app|key|voice <name>|port <number>|mode local|network|pin-home <name>" >&2; exit 2 ;;
+esac

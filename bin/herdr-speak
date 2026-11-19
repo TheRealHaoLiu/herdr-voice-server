@@ -1,0 +1,8 @@
+#!/bin/sh
+# herdr-speak "<words>": queue words an agent wants heard. Plays nothing itself; a listener
+# (the herdr-voice server, or herdr-speakd on the same machine) picks them up.
+d="${HERDR_VOICE_DIR:-$(cd "$(dirname "$0")" && pwd)}"   # the queue lives beside this command
+[ -n "$*" ] || { echo "usage: herdr-speak <words>" >&2; exit 2; }
+mkdir -p -m 700 "$d"
+printf '%s\t%s\n' "${HC_TERMINAL_ID:-unknown}" "$(printf '%s' "$*" | tr '\n\t' '  ')" >> "$d/outbox.tsv"
+echo queued

@@ -1,0 +1,13 @@
+# Secrets and runtime state live in ~/.local/state/herdr-voice, never here.
+psk
+*.key
+*.crt
+tls/
+state/
+tmp/
+primed.json
+primed-*.json
+config.json
+
+# Swift build output (kept outside the repo by mac/build.sh, ignored here in case it is not)
+.build/

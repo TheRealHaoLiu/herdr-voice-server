@@ -1,0 +1,76 @@
+#!/bin/bash
+# setup [address]: create the access key and a self-signed certificate, and record the settings they
+# depend on. Writes only to the state directory. Prints no secret. Safe to re-run: what exists and
+# still fits is kept.
+#
+# The certificate always names this computer's own loopback address (127.0.0.1), which the desktop
+# app uses. In the mode "network" (state file `mode`) it also names this computer's address on the
+# local network, for phones; that address is found here when not given, and written to `address`.
+# If the certificate on disk does not name an address that is now needed, a new one is made and the
+# old one is set aside: phones then have to install the new certificate.
+set -euo pipefail
+state="${HERDR_VOICE_STATE:-$HOME/.local/state/herdr-voice}"
+umask 077
+mkdir -p "$state/claims" "$state/tmp"
+
+if [ ! -s "$state/psk" ]; then
+  openssl rand -base64 32 | tr -d '\n=+/' > "$state/psk"
+  echo "access key: created"
+else
+  echo "access key: kept"
+fi
+
+mode="$(cat "$state/mode" 2>/dev/null || true)"; [ "$mode" = network ] || mode=local
+want="127.0.0.1"
+if [ "$mode" = network ]; then
+  ip="${1:-$(ipconfig getifaddr "$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')" 2>/dev/null || true)}"
+  [ -n "$ip" ] || ip="$(cat "$state/address" 2>/dev/null || true)"   # no network right now: keep the recorded one
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "Could not find this computer's network address. Give it: setup <address>" >&2; exit 1; }
+  echo "$ip" > "$state/address"
+  want="$want $ip"
+fi
+
+have=""
+# Read with -text, which every openssl understands; the stock macOS one (LibreSSL) has no -ext.
+if [ -s "$state/tls/leaf.crt" ]; then
+  have="$(openssl x509 -in "$state/tls/leaf.crt" -noout -text 2>/dev/null | grep -A1 'Subject Alternative Name' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | tr '\n' ' ' || true)"
+fi
+fits=yes; for a in $want; do case " $have " in *" $a "*) ;; *) fits=no ;; esac; done
+
+if [ "$fits" = yes ]; then
+  echo "certificate: kept (for: $have)"
+else
+  if [ -d "$state/tls" ]; then
+    old="$state/tls.replaced-$(date +%Y%m%d-%H%M%S)"; mv "$state/tls" "$old"
+    echo "certificate: the old one was for [ $have] and is set aside in $old"
+    echo "certificate: any phone connected before has to install the new certificate"
+  fi
+  mkdir -p "$state/tls"; cd "$state/tls"
+  san=""; permit=""
+  for a in $want; do san="${san:+$san,}IP:$a"; permit="${permit:+$permit,}permitted;IP:$a/255.255.255.255"; done
+  cat > ca.cnf <<CNF
+[req]
+distinguished_name=dn
+x509_extensions=v3
+prompt=no
+[dn]
+CN=herdr-voice CA ($(echo $want | tr ' ' ','))
+[v3]
+basicConstraints=critical,CA:TRUE,pathlen:0
+keyUsage=critical,keyCertSign
+nameConstraints=critical,$permit
+CNF
+  cat > leaf.ext <<CNF
+basicConstraints=CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=$san
+CNF
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 397 -config ca.cnf 2>/dev/null
+  openssl req -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=herdr-voice" 2>/dev/null
+  openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out leaf.crt -days 397 -extfile leaf.ext 2>/dev/null
+  # The CA can only vouch for these addresses, and its key is destroyed so it can never sign again.
+  rm -f ca.key leaf.csr ca.srl
+  openssl verify -CAfile ca.crt leaf.crt >/dev/null && echo "certificate: created for $want (valid 397 days)"
+fi
+[ -s "$state/voice" ] || echo am_echo > "$state/voice"
