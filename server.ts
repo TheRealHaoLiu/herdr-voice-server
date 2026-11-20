@@ -245,9 +245,25 @@ async function sessions() {
   }));
   return rows.sort((x, y) => y.active_ms - x.active_ms);
 }
+// What the session wrote since your last message: the text after the last `[voice]` line on its
+// screen. When no such line is found (a slash command, or it scrolled too far back) it is the end of
+// the screen as before. Either way at most the last 45 lines that are not empty.
+function sinceLastTurn(text: string): string {
+  const lines = text.split("\n").map(l => l.replace(/\s+$/, ""));
+  let at = -1;
+  for (let i = lines.length - 1; i >= 0; i--) if (/^\s*\S{0,2}\s*\[voice\] /.test(lines[i])) { at = i; break; }
+  const rules = lines.map((l, i) => /^[─━-]{20,}$/.test(l) ? i : -1).filter(i => i >= 0); // an input box drawn at the bottom is not something it wrote
+  if (rules.length >= 2 && lines.length - rules[rules.length - 2] <= 12 && rules[rules.length - 2] > at) lines.length = rules[rules.length - 2];
+  for (let i = Math.max(at + 1, lines.length - 12); i < lines.length; i++) // opencode's input box: bare bars down to a heavy rule
+    if (/^\s*┃\s*$/.test(lines[i]) && lines.slice(i).some(l => /^\s*╹?▀{20,}/.test(l)) && lines.slice(i).every(l => !l.length || /^\s*[┃╹\/]/.test(l))) { lines.length = i; break; }
+  let rest = lines;
+  if (at >= 0) { let j = at + 1; while (j < lines.length && lines[j].length) j++; rest = lines.slice(j); } // the message can wrap over several lines; it ends at the first empty one
+  rest = rest.filter(l => l.length);
+  return (rest.length ? rest : lines.filter(l => l.length)).slice(-45).join("\n");
+}
 async function screen(a: Addr): Promise<string> {
-  const r = await run(["hc", "read", "--lines", "0", a.full]);
-  return r.text().split("\n").map(l => l.replace(/\s+$/, "")).filter(l => l.length).slice(-45).join("\n");
+  const r = await run(["hc", "read", "--lines", "300", a.full]);
+  return sinceLastTurn(r.text());
 }
 async function status(a: Addr): Promise<string> {
   try { const s = JSON.parse((await run(["hc", "get", "--json", a.full])).text()).status; return typeof s === "string" ? s : s?.state ?? "unknown"; }
@@ -437,30 +453,47 @@ async function detail(a: Addr): Promise<{ state: string; kind: string; msg: stri
   const o = s && typeof s === "object" ? s : {};
   return { state: typeof s === "string" ? s : String(o.state ?? "unknown"), kind: String(o.kind ?? ""), msg: String(o.msg ?? ""), app: String(o.app ?? "") };
 }
+// The keys that answer a permission prompt, per agent program. Only programs listed here can be
+// answered from the phone. Codex: "Yes, proceed (y)" and Esc to cancel. opencode shows
+// "Allow once / Always allow / Reject" with the first one selected: Enter allows once, and two steps
+// right then Enter rejects.
+const ANSWER_KEYS: Record<string, { allow: string[]; deny: string[] }> = {
+  "claude-code": { allow: ["1"], deny: ["esc"] },
+  "codex": { allow: ["y"], deny: ["esc"] },
+  "opencode": { allow: ["enter"], deny: ["right", "right", "enter"] },
+};
+// What is being asked. herdr-core gives it for Claude Code; for Codex and opencode it is read off
+// the prompt on screen (the line that starts with "$"), with herdr-core's words as the fallback.
+async function asked(a: Addr, d: { msg: string; app: string }): Promise<string> {
+  if (d.app !== "codex" && d.app !== "opencode") return requestOf(d.msg);
+  try { const m = (await run(["hc", "read", "--lines", "0", a.full])).text().split("\n").map(l => l.match(/^\s*┃?\s*\$ (.+?)\s*$/)?.[1]).filter(Boolean); return requestOf(m[m.length - 1] ?? d.msg); }
+  catch { return requestOf(d.msg); }
+}
 const requestOf = (msg: string) => msg.replace(/^approve\s+/i, "").replace(/\s+/g, " ").trim().slice(0, 400);
 async function blockedNote(a: Addr, res: { status: string; spoken: string }, wantAudio = true) {
   if (res.status !== "blocked") return {};
   const d = await detail(a);
   if (d.state !== "blocked") return {}; // answered in the meantime
-  const what = requestOf(d.msg);
+  const what = await asked(a, d);
   const permission = d.kind === "permission";
   const text = permission ? (what ? `It is asking for permission: ${what}` : "It is asking for permission.") : "It has stopped to ask you something. Answer it in Herdr.";
-  const can = permission && d.app === "claude-code";
+  const can = permission && d.app in ANSWER_KEYS;
   const say = permission ? "It is asking for your permission." : text; // the request itself is shown, not read out: commands are tiresome to listen to
   return { blocked: true, ...(res.spoken ? {} : { error: can ? text : `${text}${permission ? " Answer it in Herdr." : ""}` }),
            ask: { text, what, can, audio: wantAudio ? await tts(say) : null, say } };
 }
 // Answer a permission prompt from the phone: Allow presses the prompt's "Yes" (key 1), Deny presses
-// Esc. Claude Code only: other agent programs' prompts take other keys. The client sends back the
+// Esc. Claude Code, Codex and opencode only (see ANSWER_KEYS): other agent programs' prompts take other keys. The client sends back the
 // request it was shown; if the prompt on screen is a different one by now, nothing is pressed and
 // the new request is returned instead, so nobody approves something they have not seen.
 async function answer(a: Addr, choice: string, shown: string, wantAudio = true) {
   if (choice !== "allow" && choice !== "deny") return { answered: false, error: "Say allow or deny." };
   const d = await detail(a);
   if (d.state !== "blocked" || d.kind !== "permission") return { answered: false, error: "That session is not waiting for permission any more." };
-  if (d.app !== "claude-code") return { answered: false, error: "Answering from here is only known to work for Claude Code sessions. Answer it in Herdr." };
-  if (requestOf(d.msg) !== shown) return { answered: false, changed: true, ...(await blockedNote(a, { status: "blocked", spoken: "" }, wantAudio)) };
-  const k = await run(["hc", "keys", "--json", a.full, choice === "allow" ? "1" : "esc"]);
+  const keys = ANSWER_KEYS[d.app];
+  if (!keys) return { answered: false, error: "Answering from here is only known to work for Claude Code, Codex and opencode sessions. Answer it in Herdr." };
+  if ((await asked(a, d)) !== shown) return { answered: false, changed: true, ...(await blockedNote(a, { status: "blocked", spoken: "" }, wantAudio)) };
+  const k = await run(["hc", "keys", "--json", a.full, ...(choice === "allow" ? keys.allow : keys.deny)]);
   if (k.code !== 0) return { answered: false, error: "Could not press the key in that session." };
   console.log(`permission ${choice === "allow" ? "allowed" : "denied"} for ${a.full}: ${shown.slice(0, 120)}`);
   remember(a.full, "note", `${choice === "allow" ? "Allowed" : "Denied"}: ${shown}`);

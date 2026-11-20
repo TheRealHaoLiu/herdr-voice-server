@@ -25,15 +25,16 @@
   details pre { margin:8px 0 0; font:11px/1.35 ui-monospace,Menlo,monospace; overflow-x:auto; white-space:pre; color:#c9ced6; }
   #talk { flex:none; height:112px; border-radius:22px; border:0; background:var(--accent); color:#1b1206; font-size:21px; font-weight:650;
           user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; touch-action:none; }
-  #stop { flex:none; background:var(--panel); color:var(--bad); border:1px solid var(--bad); border-radius:14px; padding:12px; font-size:16px; font-weight:600; }
+  #stop { color:var(--bad); border-color:var(--bad); font-weight:600; }
   #talk.rec { background:var(--bad); color:#fff; transform:scale(.98); }
   #talk.rec.away { background:#3a3f47; color:var(--dim); }
   #talk:disabled { background:#3a3f47; color:var(--dim); }
   #gate { display:flex; flex-direction:column; gap:10px; margin:auto 0; }
   #gate input { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:12px; font-size:16px; }
   #gate button { background:var(--accent); border:0; border-radius:10px; padding:12px; font-size:17px; font-weight:600; }
-  #typed { display:flex; gap:8px; }
-  #typed input { flex:1; min-width:0; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:11px 10px; font-size:16px; }
+  #typed { display:flex; gap:8px; align-items:flex-end; }
+  #typed textarea { flex:1; min-width:0; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:11px 10px;
+                    font:16px/1.35 -apple-system,system-ui,sans-serif; resize:none; height:46px; max-height:140px; overflow-y:auto; }
   #ann[aria-pressed="true"] { color:var(--accent); border-color:var(--accent); }
   .ann { align-self:flex-start; background:var(--panel); border-left:3px solid var(--ok); }
   [hidden] { display:none !important; }
@@ -51,8 +52,8 @@
   <button class="small" id="ann" aria-pressed="false" title="Let agents speak up by themselves on this device">🔔</button>
 </header>
 <div id="logs" hidden></div>
-<form id="typed" hidden><input id="text" type="text" autocomplete="off" placeholder="Type, dictate, or /command" enterkeyhint="send"><button class="small" id="go">Send</button></form>
-<button id="stop" hidden>Stop the task</button>
+<!-- Not a form, and marked as not-a-login: a browser that sees a form offers its password, card and address filling over the box. -->
+<div id="typed" hidden><textarea id="text" rows="1" name="voice-message" autocomplete="off" data-form-type="other" data-1p-ignore data-lpignore="true" placeholder="Type, dictate, or /command"></textarea><button type="button" class="small" id="go">Send</button><button type="button" class="small" id="stop" hidden>Stop</button></div>
 <button id="talk" hidden disabled>Hold to talk</button>
 <script>
 const $ = id => document.getElementById(id);
@@ -61,6 +62,9 @@ let key = store.get("voice-key") || "";
 let clientId = store.get("voice-client"); if (!clientId) { clientId = "page-" + Math.random().toString(36).slice(2, 12); store.set("voice-client", clientId); }
 let ctx, stream, rec, chunks = [], recording = false, working = false;
 
+// Show the newest message by scrolling the message list itself, never the page: scrolling the page
+// made the text box and the talk button jump, most of all with the keyboard up.
+function toEnd(el) { const l = el.classList.contains("log") ? el : el.closest(".log"); if (l) l.scrollTop = l.scrollHeight; }
 const logs = new Map(); // one chat history per session; only the selected session's is visible
 function logFor(t) { if (!logs.has(t)) { const d = document.createElement("div"); d.className = "log"; d.hidden = true; $("logs").append(d); logs.set(t, d); if (t) loadHistory(t, d); } return logs.get(t); }
 // Earlier messages for a session, kept by the server on the Mac: put above whatever this page has
@@ -73,12 +77,15 @@ async function loadHistory(t, d) {
       r.className = "row " + (x.who === "me" ? "me" : x.who === "note" ? "sys" : x.from ? "ann" : "said");
       r.textContent = x.from ? "From " + x.from + ": " + x.text : x.text; r.title = new Date(x.at).toLocaleString(); r.style.opacity = ".8"; return r; });
     const mark = document.createElement("div"); mark.className = "row sys"; mark.textContent = "— earlier —";
-    d.prepend(...rows, mark); d.lastElementChild?.scrollIntoView({block:"end"});
+    d.prepend(...rows, mark); toEnd(d);
   } catch {}
 }
-function showLog(t) { for (const [k, d] of logs) d.hidden = k !== t; const d = logFor(t); d.hidden = false; d.lastElementChild?.scrollIntoView({block:"end"}); }
-function add(cls, text, t = $("sess").value) { const d = document.createElement("div"); d.className = "row " + cls; d.textContent = text; logFor(t).append(d); d.scrollIntoView({block:"end"}); return d; }
-function addScreen(text, t) { if (!text) return; const d = document.createElement("details"); const s = document.createElement("summary"); s.textContent = "What it wrote on screen"; const p = document.createElement("pre"); p.textContent = text; d.append(s, p); logFor(t).append(d); d.scrollIntoView({block:"end"}); }
+function showLog(t) { for (const [k, d] of logs) d.hidden = k !== t; const d = logFor(t); d.hidden = false; toEnd(d); }
+function add(cls, text, t = $("sess").value) { const d = document.createElement("div"); d.className = "row " + cls; d.textContent = text; const log = logFor(t), last = log.lastElementChild; if (cls === "said" && last && last.tagName === "DETAILS" && Date.now() - last.at < 15000) last.before(d); else log.append(d); toEnd(d); return d; }
+function addScreen(text, t) { if (!text) return;
+  const last = logFor(t).lastElementChild; // a second look at the same turn updates the panel that is already there
+  if (last && last.tagName === "DETAILS") { last.querySelector("pre").textContent = text; last.at = Date.now(); return; }
+  const d = document.createElement("details"); const s = document.createElement("summary"); s.textContent = "What it wrote on screen"; const p = document.createElement("pre"); p.textContent = text; d.append(s, p); d.at = Date.now(); logFor(t).append(d); toEnd(d); }
 async function api(path, opts = {}) {
   const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), "x-voice-key": key, "x-voice-client": clientId } });
   if (r.status === 401) { key = ""; store.set("voice-key", ""); show(false); throw new Error("That key was not accepted."); }
@@ -127,7 +134,7 @@ function liveTick(t, gen) {
   liveBusy = true;
   const blob = new Blob(chunks, { type: rec.mimeType });
   api("/api/hear", { method: "POST", headers: { "content-type": blob.type || "audio/mp4" }, body: blob })
-    .then(h => { if (gen !== liveGen || !h.heard) return; if (!live) { live = add("me", "", t); live.style.opacity = ".55"; } live.textContent = h.heard + " …"; live.scrollIntoView({block:"end"}); })
+    .then(h => { if (gen !== liveGen || !h.heard) return; if (!live) { live = add("me", "", t); live.style.opacity = ".55"; } live.textContent = h.heard + " …"; toEnd(live); })
     .catch(() => {}).finally(() => { liveBusy = false; });
 }
 function dropLive() { live?.remove(); live = null; }
@@ -140,8 +147,8 @@ async function steer(blob, typed) { // sent while the agent is mid-task: goes in
   const t = $("sess").value;
   try {
     const spoken = blob ? await hear(blob, t) : null; if (blob && !spoken) return;
+    if (!blob) add("me", typed, t); // shown as it is sent, so the agent's words can never land above it
     const j = await api("/api/say?t=" + encodeURIComponent(t) + (spoken ? "&spoken=1" : ""), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: spoken || typed }) });
-    if (j.heard && !spoken) add("me", j.heard, t);
     if (j.error) { add("err", j.error, t); return; }
     // The words wait until the agent's current step ends. "Send now" has it read them at once.
     const row = add("sys", "Sent mid-task. It reads this when its current step ends. ", t);
@@ -165,7 +172,7 @@ function showAsk(ask, t, quiet = false) {
     const mk = (label, choice) => { const b = document.createElement("button"); b.className = "small"; b.textContent = label; b.style.flex = "1";
       b.onclick = () => answerAsk(ask, t, choice, row, bar); return b; };
     const yes = mk("Allow", "allow"), no = mk("Deny", "deny"); yes.style.color = "var(--ok)"; yes.style.borderColor = "var(--ok)"; no.style.color = "var(--bad)"; no.style.borderColor = "var(--bad)";
-    bar.append(yes, no); row.append(bar);
+    bar.append(yes, no); row.append(bar); toEnd(row); // the buttons made the row taller after it was scrolled to
   }
   if (quiet) return Promise.resolve();
   return (ask.audio ? play(ask.audio).catch(() => phoneSpeak(ask.say)) : Promise.resolve(phoneSpeak(ask.say)));
@@ -205,8 +212,8 @@ async function send(blob, typed) {
   setBusy(true, typed ? "Sending…" : "Listening to that…", t);
   try {
     const spoken = blob ? await hear(blob, t) : null; if (blob && !spoken) { setBusy(false, undefined, t); return; }
+    if (!blob) add("me", typed, t); // shown as it is sent, so the agent's words can never land above it
     let j = await api("/api/say?t=" + encodeURIComponent(t) + (spoken ? "&spoken=1" : ""), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: spoken || typed }) });
-    if (j.heard && !spoken) add("me", j.heard, t);
     await showResult(j, t);
     while (j.status === "working") { setBusy(true, "Still working…", t); j = await api("/api/collect?t=" + encodeURIComponent(t), { method: "POST" }); await showResult(j, t); }
   } catch (e) { add("err", e.message, t); }
@@ -224,19 +231,20 @@ async function start(e) {
     rec.ondataavailable = ev => ev.data.size && chunks.push(ev.data);
     rec.onstop = () => { const blob = new Blob(chunks, { type: rec.mimeType });
       if (cancelled) { cancelled = false; dropLive(); add("sys", "Cancelled. Nothing was sent."); paintBusy(); return; }
+      if (Date.now() - began < 500) { dropLive(); add("sys", "Hold the button while you talk. Nothing was sent."); if (steering) paintBusy(); else setBusy(false); return; } // a tap, not a hold: most likely a slip of the finger
       if (blob.size <= 2500) dropLive();
       if (steering) { $("talk").textContent = "Hold to steer"; if (blob.size > 2500) steer(blob); }
       else if (blob.size > 2500) send(blob); else setBusy(false); };
     dropLive(); const gen = ++liveGen, t = $("sess").value;
     // An iPhone hands over a recording made in pieces with its header second; the server puts it first.
-    if (LIVE) rec.start(1000); else rec.start(); recording = true; away = false;
+    if (LIVE) rec.start(1000); else rec.start(); recording = true; away = false; began = Date.now();
     clearInterval(liveTimer); if (LIVE) liveTimer = setInterval(() => liveTick(t, gen), 1000); $("talk").classList.add("rec"); $("talk").textContent = "Listening… (slide up to cancel)";
   } catch (err) { duck(false); add("err", "Microphone not available: " + err.message); }
 }
 // Cancelling: while holding, slide the finger away from the button and let go, and nothing is sent.
 // The button turns grey and says so while the finger is far enough away. On a keyboard, Esc while
 // holding the space bar does the same. A hold the system interrupts is cancelled too, not sent.
-let cancelled = false, away = false;
+let cancelled = false, away = false, began = 0;
 let holding = false; // the button or space bar is down right now
 function stop(e, cancel = false) { e.preventDefault(); duck(false); holding = false; if (!recording) return; recording = false; clearInterval(liveTimer); liveGen++;
   $("talk").classList.remove("rec", "away"); away = false; cancelled = cancel; if (!steering && !cancel) setBusy(true); rec.stop(); }
@@ -251,9 +259,16 @@ addEventListener("keydown", e => { if (e.code === "Space" && !e.repeat && !typin
 addEventListener("keyup", e => { if (e.code === "Space" && !typing()) stop(e); });
 addEventListener("keydown", e => { if (e.code === "Escape" && recording) stop(e, true); });
 $("talk").addEventListener("contextmenu", e => e.preventDefault());
-$("typed").addEventListener("submit", e => { e.preventDefault(); const v = $("text").value.trim(); if (!v) return; if (working) { $("text").value = ""; steer(null, v); return; }
+// The text box takes several lines: Enter makes a new line, the Send button sends (on a keyboard,
+// Command+Enter or Control+Enter too). It grows with what is typed, up to a few lines.
+function fitText() { const el = $("text"); el.style.height = "46px"; el.style.height = Math.min(Math.max(el.scrollHeight + 2, 46), 140) + "px"; }
+$("text").addEventListener("input", fitText);
+function sendTyped() { const v = $("text").value.trim(); if (!v) return; $("text").value = ""; fitText();
+  if (working) { steer(null, v); return; }
   try { ctx = ctx || new (window.AudioContext || window.webkitAudioContext)(); ctx.resume(); } catch {}
-  $("text").value = ""; send(null, v); });
+  send(null, v); }
+$("text").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendTyped(); } });
+$("go").addEventListener("click", sendTyped);
 $("sess").addEventListener("change", () => { store.set("voice-session", $("sess").value); showLog($("sess").value); paintBusy(); checkAsk($("sess").value); });
 // Announcements: agents speaking when you had not just asked. Each one names its session first. Only the
 // device you last talked through says it aloud; the bell turns them off on this device altogether.

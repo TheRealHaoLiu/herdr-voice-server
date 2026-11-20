@@ -17,7 +17,8 @@ All speech, listening and speaking, is done on the Mac by the app, for the phone
 you say is sent to a speech service.
 
 Status: a working prototype, started November 2026. macOS only; tried on Apple silicon, with an
-iPhone as the phone, and with herdr-core 0.1.21. Intel Macs, Android phones and older versions of
+iPhone as the phone, and with herdr-core 0.1.21. Tried with Claude Code, Codex and opencode sessions. A session
+is listed only when herdr-core reports a working state for its agent program. Intel Macs, Android phones and older versions of
 `hc` are untried.
 
 ## What you need
@@ -89,7 +90,7 @@ compacted, the instruction is sent again.
 - **Stop.** A quick tap on the app's button, a double tap of its shortcut, or the Stop button on the
   phone page.
 - **Permission prompts.** If the agent stops at a permission prompt mid-task, you hear that it is
-  asking and see what for. On the phone page, for Claude Code sessions, **Allow** and **Deny** buttons answer it.
+  asking and see what for. On the phone page, for Claude Code, Codex and opencode sessions, **Allow** and **Deny** buttons answer it.
   It takes a tap, never a spoken word, so a misheard word cannot approve a command; and if the
   request on the agent's screen has changed since you were shown it, nothing is pressed and you are
   shown the new one.
