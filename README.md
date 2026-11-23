@@ -42,7 +42,7 @@ Two things to know before you start:
 ## Start
 
 ```sh
-git clone https://github.com/TheRealHaoLiu/herdr-voice && cd herdr-voice
+git clone https://github.com/TheRealHaoLiu/herdr-voice-server && cd herdr-voice-server
 mkdir -p ~/.local/bin && ln -s "$PWD/bin/herdr-voice" ~/.local/bin/herdr-voice
 herdr-voice app
 ```
